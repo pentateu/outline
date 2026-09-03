@@ -32,6 +32,22 @@ class OIDCPluginEnvironment extends Environment {
   public OIDC_ISSUER_URL = this.toOptionalString(environment.OIDC_ISSUER_URL);
 
   /**
+   * When true, API requests carrying a platform JWT (issued by the IdP via
+   * token-exchange, INFRA-SSO-2) are verified against the IdP JWKS and mapped
+   * to a user by email. Requires OIDC_ISSUER_URL.
+   */
+  @IsOptional()
+  @CannotUseWithout("OIDC_ISSUER_URL")
+  public OIDC_JWT_VERIFY = this.toBoolean(environment.OIDC_JWT_VERIFY ?? "false");
+
+  /**
+   * JWKS URI used to verify platform JWTs. Defaults to
+   * `<OIDC_ISSUER_URL>/jwks/` when unset.
+   */
+  @IsOptional()
+  public OIDC_JWKS_URL = this.toOptionalString(environment.OIDC_JWKS_URL);
+
+  /**
    * The name of the OIDC provider, eg "GitLab" – this will be displayed on the
    * sign-in button and other places in the UI. The default value is:
    * "OpenID Connect".

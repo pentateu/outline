@@ -7,6 +7,9 @@ import tracer, {
   getRootSpanFromRequestContext,
 } from "@server/logging/tracer";
 import { User, Team, ApiKey, OAuthAuthentication } from "@server/models";
+import env from "@server/env";
+import oidcEnv from "plugins/oidc/server/env";
+import { createRemoteJWKSet, jwtVerify } from "jose";
 import type { AppContext } from "@server/types";
 import { AuthenticationType } from "@server/types";
 import { getUserForJWT } from "@server/utils/jwt";
@@ -15,6 +18,9 @@ import {
   AuthorizationError,
   UserSuspendedError,
 } from "../errors";
+
+/** Cached remote JWKS for platform JWT verification (INFRA-SSO-2). */
+let jwks: ReturnType<typeof createRemoteJWKSet> | undefined;
 
 type AuthenticationOptions = {
   /** Role required to access the route. */
@@ -239,6 +245,74 @@ async function validateAuthentication(
 
     scope = apiKey.scope ?? ["*"];
     await apiKey.updateActiveAt();
+  } else if (token.startsWith("eyJ")) {
+    // INFRA-SSO-2: platform JWT issued by Authentik (token-exchange).
+    // Verify via JWKS from discovery, then map email -> users (create on first use).
+    if (transport === "cookie") {
+      throw AuthenticationError("JWT must not be passed in the cookie");
+    }
+
+    if (!oidcEnv.OIDC_JWT_VERIFY) {
+      throw AuthenticationError("Invalid token");
+    }
+
+    if (!jwks) {
+      jwks = createRemoteJWKSet(
+        new URL(
+          oidcEnv.OIDC_JWKS_URL ??
+            `${oidcEnv.OIDC_ISSUER_URL?.replace(/\/$/, "")}/jwks/`
+        )
+      );
+    }
+
+    let payload: Record<string, unknown>;
+    try {
+      const result = await jwtVerify(token, jwks, {
+        issuer: oidcEnv.OIDC_ISSUER_URL,
+        audience: "outline",
+      });
+      payload = result.payload as Record<string, unknown>;
+    } catch (_err) {
+      throw AuthenticationError("Invalid JWT");
+    }
+
+    const email = String(payload.email ?? payload.sub ?? "")
+      .toLowerCase()
+      .trim();
+    if (!email.includes("@")) {
+      throw AuthenticationError("JWT missing email claim");
+    }
+
+    type = AuthenticationType.API;
+    user = await User.findOne({
+      where: { email },
+      include: [
+        {
+          model: Team,
+          as: "team",
+          required: true,
+        },
+      ],
+    });
+
+    if (!user && payload.preferred_username) {
+      const team = await Team.findOne();
+      if (team) {
+        user = await User.create({
+          email,
+          name: String(payload.preferred_username),
+          teamId: team.id,
+        });
+        user.teamId = team.id;
+        user.team = team;
+      }
+    }
+
+    if (!user) {
+      throw AuthenticationError("Invalid JWT");
+    }
+
+    scope = ["*"];
   } else {
     type = AuthenticationType.APP;
     const result = await getUserForJWT(token);
