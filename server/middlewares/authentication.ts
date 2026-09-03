@@ -255,7 +255,7 @@ async function validateAuthentication(
       throw AuthenticationError("JWT must not be passed in the cookie");
     }
 
-    if (!env.OIDC_JWT_VERIFY) {
+    if (!oidcEnv.OIDC_JWT_VERIFY) {
       throw AuthenticationError("Invalid token");
     }
 
