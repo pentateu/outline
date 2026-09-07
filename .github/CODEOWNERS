@@ -1,0 +1,10 @@
+# Outline fork: Dockerfile, base image, and patches need owner review.
+# Drop-in: copy to the Outline fork as `.github/CODEOWNERS`.
+# Pairs with files/outline-pipeline/ruleset.json (require_code_owner_review).
+# VERIFY FIRST: list the fork root (runbook copy step 4) and fix these paths to
+# the real layout. Drop the Dockerfile.base line if the fork has no such file.
+# Prove with a test PR touching Dockerfile that owner review is requested.
+/Dockerfile @pentateu
+/Dockerfile.base @pentateu
+/patches/ @pentateu
+/.woodpecker.yml @pentateu

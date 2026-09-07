@@ -1,12 +1,12 @@
 ARG APP_PATH=/opt/outline
-ARG BASE_IMAGE=outlinewiki/outline-base
+ARG BASE_IMAGE=outlinewiki/outline-base@sha256:e42174e53cbbe467e892be3a5d5f6782dd95fdd8feaaea17dbd238b4a11f3b1e
 FROM ${BASE_IMAGE} AS base
 
 ARG APP_PATH
 WORKDIR $APP_PATH
 
 # ---
-FROM node:26.3.0-slim AS runner
+FROM node:26.3.0-slim@sha256:95a34da32a840bd9b3b09a5b773591c16923e350174b1c50e1200c75bf15eaa9 AS runner
 
 LABEL org.opencontainers.image.source="https://github.com/outline/outline"
 
