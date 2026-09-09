@@ -45,3 +45,5 @@ HEALTHCHECK --interval=1m CMD wget -qO- "http://localhost:${PORT:-3000}/_health"
 
 EXPOSE 3000
 CMD ["node", "build/server/index.js"]
+
+# owner-review proof (INFRA-64)
