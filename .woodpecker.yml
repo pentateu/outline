@@ -1,0 +1,211 @@
+# Outline fork pipeline — fork-images Phase 2 (INFRA-9, ex HT-237).
+# Fork-copy of Infra 43d7b29 files/outline-pipeline/.woodpecker.yml (r2 APPROVED),
+# with r2 next-touch minors applied: m5 (wc -eq), m6 (CC re-mint), m7 (base_digests
+# plural — this file already writes base_digests=), plus fork-tree fixes found at
+# copy time: package.json version grep (indented JSON), ARG BASE_IMAGE resolution
+# for the base-digest loop, lint accepts pinned-ARG ${VAR} refs.
+# Design: Outline 4c35fcbf-2fef-467a-88b1-7d6088588137 (Branch strategy,
+# Promotion gates R6, Tag scheme R3, Observability).
+# Base images are digest-pinned in Dockerfile + Dockerfile.base (same commit).
+# NOTE: every step body is ONE block scalar so shell `: ` never splits YAML.
+
+labels:
+  fork: "true"
+  platform: linux/amd64
+
+steps:
+  - name: lint
+    image: alpine:3.21
+    timeout: 5m
+    commands:
+      - |
+        set -euo pipefail
+        grep -rn 'prune -f' --include='*.yml' --include='*.yaml' . && { echo 'FAIL bare prune'; exit 1; } || true
+        grep -rn 'prune -f' --include='*.yml' --include='*.yaml' .; test $? -eq 1
+        grep -rnE 'iswe-dev\|iswe-main' --include='*.yml' --include='*.yaml' . | grep -v 'grep -rnE' | grep -E ':(iswe-dev|iswe-main)([^@]|$)' && { echo 'FAIL floating moving tag'; exit 1; } || true
+        grep -rn '0.0.0.0:5000' --include='*.yml' --include='*.yaml' . && { echo 'FAIL registry on 0.0.0.0'; exit 1; } || true
+        grep -rnE '^FROM ' Dockerfile Dockerfile.base 2>/dev/null | grep -v '@sha256:' | grep -v 'FROM ${' && { echo 'FAIL unpinned FROM'; exit 1; } || true
+        grep -E '^ARG BASE_IMAGE=' Dockerfile | grep -q '@sha256:' || { echo 'FAIL unpinned BASE_IMAGE ARG'; exit 1; }
+        echo 'lint OK'
+    when:
+      event: [push, tag]
+      branch: [iswe/dev, iswe/main]
+      tag: [iswe-v*]
+
+  - name: build
+    image: docker:latest
+    timeout: 20m
+    depends_on: [lint]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    commands:
+      - |
+        set -euo pipefail
+        SHORT_SHA=$(echo "$CI_COMMIT_SHA" | cut -c1-7)
+        UPSTREAM_VER=$(grep -E '"version":' package.json | head -1 | cut -d'"' -f4)
+        TAG="$UPSTREAM_VER-iswe-$SHORT_SHA"
+        echo "$TAG" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+)?-iswe-[0-9a-f]{7}$' || { echo "FAIL tag $TAG violates D2"; exit 1; }
+        echo "$TAG" > .fork-tag
+        BASE_IMAGE_ARG=$(grep -E '^ARG BASE_IMAGE=' Dockerfile | cut -d= -f2)
+        BASE_COUNT=$(grep -hE '^FROM ' Dockerfile Dockerfile.base | wc -l | tr -d ' ')
+        grep -hE '^FROM ' Dockerfile Dockerfile.base | awk '{print $2}' | sed "s|\${BASE_IMAGE}|$BASE_IMAGE_ARG|" | while read -r BASE_REF; do
+          docker pull "$BASE_REF"
+          docker inspect --format='{{index .RepoDigests 0}}' "$BASE_REF"
+        done > .fork-base-digests
+        test "$(wc -l < .fork-base-digests | tr -d ' ')" -eq "$BASE_COUNT"
+        cat .fork-base-digests
+        docker build -t "outline-build:$TAG" .
+        echo "build OK tag=$TAG"
+    when:
+      event: [push, tag]
+      branch: [iswe/dev, iswe/main]
+      tag: [iswe-v*]
+
+  - name: test-outline
+    image: docker:latest
+    timeout: 10m
+    depends_on: [build]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    secrets: [platform-token]
+    commands:
+      - |
+        set -euo pipefail
+        TAG=$(cat .fork-tag)
+        T0=$(date +%s)
+        decode() { p=$(echo "$1" | cut -d. -f2); case $((${#p} % 4)) in 2) p="$p==";; 3) p="$p=";; esac; echo "$p" | tr '_-' '/+' | base64 -d; }
+        mint_cc() {
+          CC_RESP=$(curl -sf --max-time 10 --retry 3 -X POST https://auth.iswe.co.nz/application/o/token/ -d grant_type=client_credentials -d client_id=platform --data-urlencode client_secret="$PLATFORM_TOKEN" -d scope="openid profile email")
+          CC=$(echo "$CC_RESP" | jq -r .access_token)
+          test -n "$CC" && test "$CC" != "null"
+          test "$(decode "$CC" | jq -r .sub)" = "platform@iswe.co.nz"
+        }
+        mint_seat() {
+          SEAT_RESP=$(curl -sf --max-time 10 --retry 3 -X POST https://auth.iswe.co.nz/application/o/token/ -d grant_type=urn:ietf:params:oauth:grant-type:token-exchange -d client_id=platform --data-urlencode client_secret="$PLATFORM_TOKEN" -d subject_token="$CC" -d subject_token_type=urn:ietf:params:oauth:token-type:access_token -d requested_subject=dev1@iswe.co.nz -d "$1=outline")
+          SEAT=$(echo "$SEAT_RESP" | jq -r .access_token)
+          test -n "$SEAT" && test "$SEAT" != "null"
+          test "$(echo "$SEAT_RESP" | jq -r .expires_in)" = "300"
+          test "$(decode "$SEAT" | jq -r .iss)" = "https://auth.iswe.co.nz/application/o/outline/"
+          test "$(decode "$SEAT" | jq -r .sub)" = "dev1@iswe.co.nz"
+          test "$(decode "$SEAT" | jq -r .aud)" = "outline"
+          IAT=$(decode "$SEAT" | jq -r .iat); EXP=$(decode "$SEAT" | jq -r .exp); test $((EXP - IAT)) -eq 300
+          decode "$SEAT" | jq -e '(.email_verified // true) == true'
+        }
+        curl -sf --max-time 10 --retry 3 https://docs.iswe.co.nz/_health | grep -q OK
+        mint_cc
+        mint_seat aud
+        mint_seat audience
+        curl -sf --max-time 10 --retry 3 https://auth.iswe.co.nz/application/o/outline/.well-known/openid-configuration | jq -e '.issuer == "https://auth.iswe.co.nz/application/o/outline/"'
+        curl -sf --max-time 10 --retry 3 https://auth.iswe.co.nz/application/o/outline/.well-known/openid-configuration | jq -e '.jwks_uri | contains("/o/outline/jwks/")'
+        curl -sf --max-time 10 --retry 3 https://auth.iswe.co.nz/application/o/outline/.well-known/openid-configuration | jq -e '.grant_types_supported | index("urn:ietf:params:oauth:grant-type:token-exchange")'
+        curl -sf --max-time 10 --retry 3 -H "Authorization: Bearer $SEAT" https://docs.iswe.co.nz/api/collections.list | jq -e '.'
+        if [ $(($(date +%s) - T0)) -gt 240 ]; then mint_cc; mint_seat aud; fi
+        docker run --rm --network host curlimages/curl:8.11.1 -sf --max-time 10 --retry 3 -H "Authorization: Bearer $SEAT" http://127.0.0.1:8098/api/collections.list
+        code=$(curl -s -o /tmp/out.json -w "%{http_code}" --max-time 10 --retry 3 -X POST https://auth.iswe.co.nz/application/o/token/ -d grant_type=urn:ietf:params:oauth:grant-type:token-exchange -d client_id=platform --data-urlencode client_secret="$PLATFORM_TOKEN" -d subject_token="$CC" -d requested_subject=dev1@iswe.co.nz -d aud=unknown); test "$code" = "400"; grep -q invalid_grant /tmp/out.json
+        code=$(curl -s -o /tmp/out.json -w "%{http_code}" --max-time 10 --retry 3 -X POST https://auth.iswe.co.nz/application/o/token/ -d grant_type=urn:ietf:params:oauth:grant-type:token-exchange -d client_id=platform --data-urlencode client_secret="$PLATFORM_TOKEN" -d subject_token="$CC" -d requested_subject=dev1@iswe.co.nz -d aud=platform); test "$code" = "400"; grep -q invalid_grant /tmp/out.json
+        code=$(curl -s -o /tmp/out.json -w "%{http_code}" --max-time 10 --retry 3 -X POST https://auth.iswe.co.nz/application/o/token/ -d grant_type=urn:ietf:params:oauth:grant-type:token-exchange -d client_id=platform --data-urlencode client_secret="$PLATFORM_TOKEN" -d subject_token="$CC" -d requested_subject=ghost@iswe.co.nz -d aud=outline); test "$code" = "400"; grep -q invalid_grant /tmp/out.json
+        code=$(curl -s -o /tmp/out.json -w "%{http_code}" --max-time 10 --retry 3 -X POST https://auth.iswe.co.nz/application/o/token/ -d grant_type=urn:ietf:params:oauth:grant-type:token-exchange -d client_id=platform --data-urlencode client_secret="$PLATFORM_TOKEN" -d subject_token="$CC" -d aud=outline); test "$code" = "400"; grep -q invalid_grant /tmp/out.json
+        echo "test-outline OK tag=$TAG elapsed=$(($(date +%s)-T0))s"
+    when:
+      event: [push, tag]
+      branch: [iswe/dev, iswe/main]
+      tag: [iswe-v*]
+
+  - name: push
+    image: docker:latest
+    timeout: 10m
+    depends_on: [build, test-outline]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    secrets: [registry-username, registry-password]
+    commands:
+      - |
+        set -euo pipefail
+        df -h /var/lib/docker | tail -1
+        TAG=$(cat .fork-tag)
+        echo "$REGISTRY_PASSWORD" | docker login 100.108.226.99:5000 -u "$REGISTRY_USER" --password-stdin
+        docker tag "outline-build:$TAG" "100.108.226.99:5000/outline:$TAG"
+        docker push "100.108.226.99:5000/outline:$TAG"
+        echo "push OK 100.108.226.99:5000/outline:$TAG"
+    when:
+      event: [push, tag]
+      branch: [iswe/dev, iswe/main]
+      tag: [iswe-v*]
+
+  - name: pin
+    image: docker:latest
+    timeout: 5m
+    depends_on: [push]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    commands:
+      - |
+        set -euo pipefail
+        TAG=$(cat .fork-tag)
+        DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "100.108.226.99:5000/outline:$TAG" | cut -d@ -f2)
+        echo "$DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$' || { echo "FAIL bad digest $DIGEST"; exit 1; }
+        echo "$DIGEST" > .fork-digest
+        echo "100.108.226.99:5000/outline@sha256:$(cat .fork-digest)" > .fork-ref
+        SHORT_SHA=$(echo "$CI_COMMIT_SHA" | cut -c1-7)
+        printf 'repo=outline sha=%s tag=%s digest=%s\nbase_digests=%s\n' "$SHORT_SHA" "$TAG" "$DIGEST" "$(paste -sd, .fork-base-digests)" | tee .fork-pin
+        cat .fork-pin
+    when:
+      event: [push, tag]
+      branch: [iswe/dev, iswe/main]
+      tag: [iswe-v*]
+
+  - name: inventory-gate
+    image: docker:latest
+    timeout: 5m
+    depends_on: [pin]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    commands:
+      - |
+        set -euo pipefail
+        REF=$(cat .fork-ref)
+        echo "$REF" | grep -Eq '^100\.108\.226\.99:5000/outline@sha256:[0-9a-f]{64}$' || { echo "FAIL bad ref $REF"; exit 1; }
+        docker pull "$REF"
+        LIVE="100.108.226.99:5000/outline@$(docker inspect --format='{{index .RepoDigests 0}}' "$REF" | cut -d@ -f2)"
+        test "$LIVE" = "$REF" || { echo "FAIL registry $LIVE != pin $REF"; exit 1; }
+        echo "inventory-gate OK $REF (3-way diff runs in recon cron + deploy pre-check)"
+    when:
+      event: [push, tag]
+      branch: [iswe/dev, iswe/main]
+      tag: [iswe-v*]
+
+  - name: deploy
+    image: docker:latest
+    timeout: 15m
+    depends_on: [pin, inventory-gate]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    secrets: [registry-username, registry-password, deploy-ssh-key]
+    commands:
+      - |
+        set -euo pipefail
+        REF=$(cat .fork-ref)
+        mkdir -p ~/.ssh && chmod 700 ~/.ssh
+        printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
+        SSH="ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/root/.ssh/known_hosts"
+        TARGET=dev
+        if [ -n "${CI_COMMIT_TAG:-}" ] || [ "$CI_COMMIT_BRANCH" = "iswe/main" ]; then TARGET=prod; elif [ "$CI_COMMIT_BRANCH" = "iswe/dev" ]; then TARGET=dev; else echo "FAIL unknown target branch=$CI_COMMIT_BRANCH tag=${CI_COMMIT_TAG:-none}"; exit 1; fi
+        echo "deploy target=$TARGET ref=$REF"
+        $SSH "root@100.108.226.99" "set -euo pipefail; docker pull '$REF'; docker inspect --format='{{index .RepoDigests 0}}' '$REF'"
+        $SSH "root@100.108.226.99" "/srv/outline-$TARGET/deploy.sh '$REF'"
+        i=0; while [ $i -lt 45 ]; do if curl -sf --max-time 10 --retry 3 "https://docs.iswe.co.nz/_health" | grep -q OK; then echo "deploy OK $TARGET $REF"; exit 0; fi; sleep 2; i=$((i+1)); done; echo 'deploy FAILED health wait'; exit 1
+    when:
+      event: [push, tag]
+      branch: [iswe/dev, iswe/main]
+      tag: [iswe-v*]
+
+  - name: notify-fail
+    image: curlimages/curl:8.11.1
+    timeout: 2m
+    secrets: [ntfy-url]
+    commands:
+      - |
+        set -euo pipefail
+        curl -sf --max-time 10 --retry 3 -d "fork outline $CI_COMMIT_BRANCH ${CI_COMMIT_TAG:-none} failed" "$NTFY_URL"
+    when:
+      status: [failure]
