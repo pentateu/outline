@@ -736,6 +736,16 @@ export class DocumentHelper {
 
       document.state = Buffer.from(state);
       document.changed("state", true);
+    } else {
+      // The document has no collaborative state yet (for example, created
+      // through the API). Seed it from the new content so later collaborative
+      // saves and the API fan-out share one base instead of a null state.
+      const fresh = ProsemirrorHelper.toYDoc(
+        doc.toJSON() as ProsemirrorData,
+        "default"
+      );
+      document.state = ProsemirrorHelper.toState(fresh);
+      document.changed("state", true);
     }
 
     return document;

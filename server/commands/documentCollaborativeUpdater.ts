@@ -24,6 +24,41 @@ type Props = {
   clientVersion: string | null;
 };
 
+/**
+ * Window after a PG write during which an empty collaborative save is treated
+ * as a stale reconnect rather than a deliberate clear. Steady-state clears of
+ * older documents persist exactly as before.
+ */
+const EMPTY_OVER_FRESH_WINDOW_MS = 5 * 60 * 1000;
+
+function isEffectivelyEmpty(data: ProsemirrorData): boolean {
+  try {
+    return Node.fromJSON(schema, data).textContent.trim().length === 0;
+  } catch {
+    return false;
+  }
+}
+
+function isPassingEmptyStateOverFreshContent(
+  pgUpdatedAt: Date,
+  memoryContent: ProsemirrorData,
+  pgContent: ProsemirrorData | null
+): boolean {
+  if (!pgContent) {
+    return false;
+  }
+  if (
+    Date.now() - new Date(pgUpdatedAt).getTime() >
+    EMPTY_OVER_FRESH_WINDOW_MS
+  ) {
+    return false;
+  }
+  if (!isEffectivelyEmpty(memoryContent)) {
+    return false;
+  }
+  return !isEffectivelyEmpty(pgContent);
+}
+
 export default async function documentCollaborativeUpdater({
   documentId,
   ydoc,
@@ -68,6 +103,16 @@ export default async function documentCollaborativeUpdater({
         document.lastModifiedById);
 
     if (isUnchanged) {
+      return;
+    }
+
+    if (
+      !isDeleted &&
+      isPassingEmptyStateOverFreshContent(document.updatedAt, content, document.content)
+    ) {
+      Logger.warn(
+        `Refusing to persist empty collaborative state over fresh content for ${documentId} (pg updated ${document.updatedAt.toISOString()})`
+      );
       return;
     }
 
