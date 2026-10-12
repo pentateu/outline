@@ -251,14 +251,6 @@ async function validateAuthentication(
     // IMPORTANT: Outline session cookies are ALSO JWTs (eyJ, signed locally).
     // Gate on the IdP issuer claim so session tokens fall through to getUserForJWT —
     // otherwise web login loops forever (session token -> JWKS fail -> 401 -> login).
-    if (transport === "cookie") {
-      throw AuthenticationError("JWT must not be passed in the cookie");
-    }
-
-    if (!oidcEnv.OIDC_JWT_VERIFY) {
-      throw AuthenticationError("Invalid token");
-    }
-
     let issClaim = "";
     try {
       const payloadJson = JSON.parse(
@@ -281,6 +273,14 @@ async function validateAuthentication(
       user = result.user;
       service = result.service;
     } else {
+      if (transport === "cookie") {
+        throw AuthenticationError("JWT must not be passed in the cookie");
+      }
+
+      if (!oidcEnv.OIDC_JWT_VERIFY) {
+        throw AuthenticationError("Invalid token");
+      }
+
       if (!jwks) {
         jwks = createRemoteJWKSet(
           new URL(
