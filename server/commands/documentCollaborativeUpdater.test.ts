@@ -76,4 +76,50 @@ describe("documentCollaborativeUpdater", () => {
     await document.reload();
     expect(document.updatedAt).toEqual(updatedAt);
   });
+
+  it("refuses an empty collaborative save over freshly written content", async () => {
+    const user = await buildUser();
+    const document = await buildDocument({
+      teamId: user.teamId,
+      userId: user.id,
+    });
+    const content = document.content;
+
+    await documentCollaborativeUpdater({
+      documentId: document.id,
+      ydoc: buildYDoc([]),
+      sessionCollaboratorIds: [user.id],
+      isLastConnection: true,
+      clientVersion: null,
+    });
+
+    await document.reload();
+    expect(document.content).toEqual(content);
+  });
+
+  it("persists an empty collaborative save over older content", async () => {
+    const user = await buildUser();
+    const document = await buildDocument({
+      teamId: user.teamId,
+      userId: user.id,
+    });
+    const content = document.content;
+    const now = Date.now();
+    const advance = vi.spyOn(Date, "now").mockReturnValue(now + 10 * 60 * 1000);
+
+    try {
+      await documentCollaborativeUpdater({
+        documentId: document.id,
+        ydoc: buildYDoc([]),
+        sessionCollaboratorIds: [user.id],
+        isLastConnection: true,
+        clientVersion: null,
+      });
+    } finally {
+      advance.mockRestore();
+    }
+
+    await document.reload();
+    expect(document.content).not.toEqual(content);
+  });
 });
