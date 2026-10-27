@@ -293,7 +293,7 @@ async function validateAuthentication(
       let payload: Record<string, unknown>;
       try {
         const result = await jwtVerify(token, jwks, {
-          issuer: expectedIssuer,
+          issuer: [expectedIssuer, `${expectedIssuer}/`],
           audience: "outline",
         });
         payload = result.payload as Record<string, unknown>;
